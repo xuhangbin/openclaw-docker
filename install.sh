@@ -302,6 +302,7 @@ fi
 log_step "Setting up installation directory..."
 mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR"
+COMPOSE_FILE="$INSTALL_DIR/docker-compose.yml"
 log_success "Created $INSTALL_DIR"
 
 log_step "Creating instance home and data directories..."
@@ -330,25 +331,25 @@ mkdir -p "$OPENCLAW_DIR/workspace"
 log_success "Created $INSTANCE_HOME and $OPENCLAW_DIR"
 
 log_step "Downloading docker-compose.yml..."
-curl -fsSL "$COMPOSE_URL" -o docker-compose.yml
+curl -fsSL "$COMPOSE_URL" -o "$COMPOSE_FILE"
 
 # Replace host mount path with instance home (multi-instance data isolation)
-if grep -q "~/.openclaw" docker-compose.yml; then
-    sed -i.bak "s|~/.openclaw|$OPENCLAW_DIR|g" docker-compose.yml
-    rm -f docker-compose.yml.bak
+if grep -q "~/.openclaw" "$COMPOSE_FILE"; then
+    sed -i.bak "s|~/.openclaw|$OPENCLAW_DIR|g" "$COMPOSE_FILE"
+    rm -f "$COMPOSE_FILE.bak"
     log_success "Updated docker-compose.yml mounts to $OPENCLAW_DIR"
 fi
 
 # Container names with username prefix (e.g. abc-openclaw-gateway, abc-openclaw-socat)
 # Remove any existing container_name lines to avoid duplicate key (template or previous run)
-sed -i.bak '/^    container_name:/d' docker-compose.yml
-rm -f docker-compose.yml.bak
+sed -i.bak '/^    container_name:/d' "$COMPOSE_FILE"
+rm -f "$COMPOSE_FILE.bak"
 awk -v p="$COMPOSE_PROJECT" '
   /^  openclaw-gateway:/  { print; print "    container_name: " p "-gateway"; next }
   /^  socat-proxy:/       { print; print "    container_name: " p "-socat"; next }
   /^  openclaw-cli:/      { print; print "    container_name: " p "-cli"; next }
   { print }
-' docker-compose.yml > docker-compose.yml.tmp && mv docker-compose.yml.tmp docker-compose.yml
+' "$COMPOSE_FILE" > "$COMPOSE_FILE.tmp" && mv "$COMPOSE_FILE.tmp" "$COMPOSE_FILE"
 
 # Port allocation: always use 10010, 10015, 10020... (find first free pair)
 find_free_port_pair
@@ -357,24 +358,29 @@ find_free_port_pair
 if [ "$HOST_NETWORK" = true ]; then
     log_success "Using host network: gateway $GATEWAY_PORT, dashboard $DASHBOARD_PORT (direct on host)"
     # Remove ports block and add network_mode: host
-    sed -i.bak '/^    ports:$/d;/^      - "18789:18789"$/d;/^      - "18790:18790"$/d' docker-compose.yml
-    awk '/tty: true/ { if (++tty==1) { print; print "    network_mode: \"host\""; next } }1' docker-compose.yml > docker-compose.yml.tmp && mv docker-compose.yml.tmp docker-compose.yml
+    sed -i.bak '/^    ports:$/d;/^      - "18789:18789"$/d;/^      - "18790:18790"$/d' "$COMPOSE_FILE"
+    awk '/tty: true/ { if (++tty==1) { print; print "    network_mode: \"host\""; next } }1' "$COMPOSE_FILE" > "$COMPOSE_FILE.tmp" && mv "$COMPOSE_FILE.tmp" "$COMPOSE_FILE"
     # Gateway listens on 18789 in container/host; use two socats to expose GATEWAY_PORT and DASHBOARD_PORT
     # Socat 1 (existing): dashboard on DASHBOARD_PORT -> 127.0.0.1:18789
-    sed -i.bak "s|TCP-LISTEN:18790,fork,bind=0.0.0.0,reuseaddr TCP:127.0.0.1:18789|TCP-LISTEN:${DASHBOARD_PORT},fork,bind=0.0.0.0,reuseaddr TCP:127.0.0.1:18789|" docker-compose.yml
+    sed -i.bak "s|TCP-LISTEN:18790,fork,bind=0.0.0.0,reuseaddr TCP:127.0.0.1:18789|TCP-LISTEN:${DASHBOARD_PORT},fork,bind=0.0.0.0,reuseaddr TCP:127.0.0.1:18789|" "$COMPOSE_FILE"
     # Socat 2 (new): gateway on GATEWAY_PORT -> 127.0.0.1:18789 (insert before openclaw-cli)
     awk -v gw="$GATEWAY_PORT" -v p="$COMPOSE_PROJECT" '
       /^  openclaw-cli:/ { print "  socat-gateway:"; print "    container_name: " p "-socat-gateway"; print "    image: alpine/socat"; print "    restart: unless-stopped"; print "    network_mode: \"service:openclaw-gateway\""; print "    command: \"TCP-LISTEN:"gw",fork,bind=0.0.0.0,reuseaddr TCP:127.0.0.1:18789\""; print "" }
       { print }
-    ' docker-compose.yml > docker-compose.yml.tmp && mv docker-compose.yml.tmp docker-compose.yml
+    ' "$COMPOSE_FILE" > "$COMPOSE_FILE.tmp" && mv "$COMPOSE_FILE.tmp" "$COMPOSE_FILE"
 else
     log_success "Using bridge: gateway $GATEWAY_PORT, dashboard $DASHBOARD_PORT (bound to 0.0.0.0)"
-    sed -i.bak "s|\"18789:18789\"|\"0.0.0.0:${GATEWAY_PORT}:18789\"|" docker-compose.yml
-    sed -i.bak "s|\"18790:18790\"|\"0.0.0.0:${DASHBOARD_PORT}:18790\"|" docker-compose.yml
+    sed -i.bak "s|\"18789:18789\"|\"0.0.0.0:${GATEWAY_PORT}:18789\"|" "$COMPOSE_FILE"
+    sed -i.bak "s|\"18790:18790\"|\"0.0.0.0:${DASHBOARD_PORT}:18790\"|" "$COMPOSE_FILE"
 fi
-rm -f docker-compose.yml.bak
+rm -f "$COMPOSE_FILE.bak"
 
-log_success "Downloaded docker-compose.yml"
+# Validate compose file and ensure it is used for up/run
+if ! $COMPOSE_CMD -f "$COMPOSE_FILE" config -q 2>/dev/null; then
+    log_error "Generated docker-compose.yml is invalid. Check $COMPOSE_FILE"
+    exit 1
+fi
+log_success "Downloaded and configured docker-compose.yml"
 
 # Fix permissions for container access
 # Docker container runs as node user (UID 1000, GID 1000)
@@ -428,9 +434,9 @@ if [ "$SKIP_ONBOARD" = false ]; then
     echo -e "${YELLOW}Follow the prompts to complete setup.${NC}\n"
     
     # Run onboarding interactively (works with bash process substitution)
-    if ! $COMPOSE_CMD -p "$COMPOSE_PROJECT" run --rm openclaw-cli onboard; then
+    if ! $COMPOSE_CMD -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT" run --rm openclaw-cli onboard; then
         log_warning "Onboarding was cancelled or failed"
-        echo -e "${YELLOW}You can run it later with:${NC} cd $INSTALL_DIR && $COMPOSE_CMD -p $COMPOSE_PROJECT run --rm openclaw-cli onboard"
+        echo -e "${YELLOW}You can run it later with:${NC} cd $INSTALL_DIR && $COMPOSE_CMD -f $COMPOSE_FILE -p $COMPOSE_PROJECT run --rm openclaw-cli onboard"
     else
         log_success "Onboarding complete!"
     fi
@@ -439,7 +445,7 @@ fi
 # Start gateway
 if [ "$NO_START" = false ]; then
     log_step "Starting OpenClaw gateway..."
-    $COMPOSE_CMD -p "$COMPOSE_PROJECT" up -d openclaw-gateway
+    $COMPOSE_CMD -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT" up -d openclaw-gateway
     
     # Wait for gateway to be ready
     echo -n "Waiting for gateway to start"
@@ -468,6 +474,8 @@ echo -e "${GREEN}╚════════════════════
 
 echo -e "\n${BOLD}Quick reference:${NC}"
 echo -e "  ${CYAN}Instance:${NC}       $COMPOSE_PROJECT (user: $USERNAME)"
+echo -e "  ${CYAN}Gateway container:${NC} ${COMPOSE_PROJECT}-gateway (use this name for docker logs)"
+echo -e "  ${CYAN}Compose file:${NC}   $COMPOSE_FILE"
 echo -e "  ${CYAN}Dashboard:${NC}      http://localhost:${DASHBOARD_PORT}/?token=YOUR_TOKEN"
 echo -e "  ${CYAN}Gateway:${NC}        http://localhost:${GATEWAY_PORT}"
 echo -e "  ${CYAN}From other machines:${NC} Use this host's IP (e.g. http://<host-ip>:${DASHBOARD_PORT}). Ensure firewall allows ports ${GATEWAY_PORT}, ${DASHBOARD_PORT}."
@@ -478,12 +486,12 @@ echo -e "  ${CYAN}Config:${NC}         $OPENCLAW_DIR"
 echo -e "  ${CYAN}Install dir:${NC}    $INSTALL_DIR"
 
 echo -e "\n${BOLD}Useful commands:${NC}"
-echo -e "  ${CYAN}View logs:${NC}      cd $INSTALL_DIR && $COMPOSE_CMD -p $COMPOSE_PROJECT logs -f openclaw-gateway"
-echo -e "  ${CYAN}Stop:${NC}           cd $INSTALL_DIR && $COMPOSE_CMD -p $COMPOSE_PROJECT down"
-echo -e "  ${CYAN}Start:${NC}          cd $INSTALL_DIR && $COMPOSE_CMD -p $COMPOSE_PROJECT up -d openclaw-gateway"
-echo -e "  ${CYAN}Restart:${NC}        cd $INSTALL_DIR && $COMPOSE_CMD -p $COMPOSE_PROJECT restart openclaw-gateway"
-echo -e "  ${CYAN}CLI:${NC}            cd $INSTALL_DIR && $COMPOSE_CMD -p $COMPOSE_PROJECT run --rm openclaw-cli <command>"
-echo -e "  ${CYAN}Update:${NC}         docker pull $IMAGE && cd $INSTALL_DIR && $COMPOSE_CMD -p $COMPOSE_PROJECT up -d"
+echo -e "  ${CYAN}View logs:${NC}      cd $INSTALL_DIR && $COMPOSE_CMD -f $COMPOSE_FILE -p $COMPOSE_PROJECT logs -f openclaw-gateway"
+echo -e "  ${CYAN}Stop:${NC}           cd $INSTALL_DIR && $COMPOSE_CMD -f $COMPOSE_FILE -p $COMPOSE_PROJECT down"
+echo -e "  ${CYAN}Start:${NC}          cd $INSTALL_DIR && $COMPOSE_CMD -f $COMPOSE_FILE -p $COMPOSE_PROJECT up -d openclaw-gateway"
+echo -e "  ${CYAN}Restart:${NC}        cd $INSTALL_DIR && $COMPOSE_CMD -f $COMPOSE_FILE -p $COMPOSE_PROJECT restart openclaw-gateway"
+echo -e "  ${CYAN}CLI:${NC}            cd $INSTALL_DIR && $COMPOSE_CMD -f $COMPOSE_FILE -p $COMPOSE_PROJECT run --rm openclaw-cli <command>"
+echo -e "  ${CYAN}Update:${NC}         docker pull $IMAGE && cd $INSTALL_DIR && $COMPOSE_CMD -f $COMPOSE_FILE -p $COMPOSE_PROJECT up -d"
 
 echo -e "\n${BOLD}Documentation:${NC}  https://docs.openclaw.ai"
 echo -e "${BOLD}Support:${NC}        https://discord.gg/clawd"
