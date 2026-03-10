@@ -357,12 +357,14 @@ find_free_port_pair
 # Network: default host (ports on host directly), or bridge with 0.0.0.0 mapping
 if [ "$HOST_NETWORK" = true ]; then
     log_success "Using host network: gateway $GATEWAY_PORT, dashboard $DASHBOARD_PORT (direct on host)"
-    # Remove ports block and add network_mode: host
-    sed -i.bak '/^    ports:$/d;/^      - "18789:18789"$/d;/^      - "18790:18790"$/d' "$COMPOSE_FILE"
+    # Comment out ports block (network_mode: host ignores port mapping; keep ports in file for reference)
+    sed -i.bak 's|^    ports:$|    # ports (host mode: not used)|' "$COMPOSE_FILE"
+    sed -i.bak "s|^      - \"18789:18789\"$|    #   - \"${GATEWAY_PORT}:18789\"|" "$COMPOSE_FILE"
+    sed -i.bak "s|^      - \"18790:18790\"$|    #   - \"${DASHBOARD_PORT}:18790\"|" "$COMPOSE_FILE"
     awk '/tty: true/ { if (++tty==1) { print; print "    network_mode: \"host\""; next } }1' "$COMPOSE_FILE" > "$COMPOSE_FILE.tmp" && mv "$COMPOSE_FILE.tmp" "$COMPOSE_FILE"
     # Gateway listens on 18789 in container/host; use two socats to expose GATEWAY_PORT and DASHBOARD_PORT
     # Socat 1 (existing): dashboard on DASHBOARD_PORT -> 127.0.0.1:18789
-    sed -i.bak "s|TCP-LISTEN:18790,fork,bind=0.0.0.0,reuseaddr TCP:127.0.0.1:18789|TCP-LISTEN:${DASHBOARD_PORT},fork,bind=0.0.0.0,reuseaddr TCP:127.0.0.1:18789|" "$COMPOSE_FILE"
+    sed -i.bak "s|TCP-LISTEN:18790,fork,bind=0.0.0.0,reuseaddr TCP:127.0.0.1:18789|TCP-LISTEN:${DASHBOARD_PORT},fork,bind=0.0.0.0,reuseaddr TCP:127.0.0.1:${GATEWAY_PORT}|" "$COMPOSE_FILE"
     # Socat 2 (new): gateway on GATEWAY_PORT -> 127.0.0.1:18789 (insert before openclaw-cli)
     awk -v gw="$GATEWAY_PORT" -v p="$COMPOSE_PROJECT" '
       /^  openclaw-cli:/ { print "  socat-gateway:"; print "    container_name: " p "-socat-gateway"; print "    image: alpine/socat"; print "    restart: unless-stopped"; print "    network_mode: \"service:openclaw-gateway\""; print "    command: \"TCP-LISTEN:"gw",fork,bind=0.0.0.0,reuseaddr TCP:127.0.0.1:18789\""; print "" }
@@ -370,9 +372,14 @@ if [ "$HOST_NETWORK" = true ]; then
     ' "$COMPOSE_FILE" > "$COMPOSE_FILE.tmp" && mv "$COMPOSE_FILE.tmp" "$COMPOSE_FILE"
 else
     log_success "Using bridge: gateway $GATEWAY_PORT, dashboard $DASHBOARD_PORT (bound to 0.0.0.0)"
-    sed -i.bak "s|\"18789:18789\"|\"0.0.0.0:${GATEWAY_PORT}:18789\"|" "$COMPOSE_FILE"
-    sed -i.bak "s|\"18790:18790\"|\"0.0.0.0:${DASHBOARD_PORT}:18790\"|" "$COMPOSE_FILE"
+    # Replace port mappings (match with or without quotes for robustness)
+    sed -i.bak "s|18789:18789|0.0.0.0:${GATEWAY_PORT}:18789|g" "$COMPOSE_FILE"
+    sed -i.bak "s|18790:18790|0.0.0.0:${DASHBOARD_PORT}:18790|g" "$COMPOSE_FILE"
 fi
+rm -f "$COMPOSE_FILE.bak"
+
+# Set gateway to listen on allocated port (e.g. gateway --port 10010)
+sed -i.bak "s|command: \[\"gateway\"\]|command: [\"gateway\", \"--port\", \"$GATEWAY_PORT\"]|" "$COMPOSE_FILE"
 rm -f "$COMPOSE_FILE.bak"
 
 # Validate compose file and ensure it is used for up/run
