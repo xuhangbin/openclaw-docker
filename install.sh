@@ -22,10 +22,16 @@ BOLD='\033[1m'
 NC='\033[0m' # No Color
 
 # Config
-INSTALL_DIR="${OPENCLAW_INSTALL_DIR:-$HOME/openclaw}"
 IMAGE="ghcr.io/phioranex/openclaw-docker:latest"
 REPO_URL="https://github.com/phioranex/openclaw-docker"
 COMPOSE_URL="https://raw.githubusercontent.com/phioranex/openclaw-docker/main/docker-compose.yml"
+
+# Multi-instance: username (required for setup)
+USERNAME=""
+INSTANCE_HOME=""
+COMPOSE_PROJECT=""
+GATEWAY_PORT=""
+DASHBOARD_PORT=""
 
 # Detect if we have a TTY (for Docker interactive mode)
 if [ -t 0 ]; then
@@ -54,6 +60,10 @@ while [[ $# -gt 0 ]]; do
             PULL_ONLY=true
             shift
             ;;
+        --username)
+            USERNAME="$2"
+            shift 2
+            ;;
         --install-dir)
             INSTALL_DIR="$2"
             shift 2
@@ -64,8 +74,9 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: install.sh [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --install-dir DIR   Installation directory (default: ~/openclaw)"
-            echo "  --no-start          Don't start the gateway after setup"
+            echo "  --username NAME     Instance username (creates /home/NAME, used as stack prefix)"
+            echo "  --install-dir DIR  Installation directory (default: /home/<username>/openclaw)"
+            echo "  --no-start         Don't start the gateway after setup"
             echo "  --skip-onboard      Skip onboarding wizard"
             echo "  --pull-only         Only pull the image, don't set up"
             echo "  --help, -h          Show this help message"
@@ -141,6 +152,60 @@ check_command() {
     fi
 }
 
+# Validate username: only letters, numbers, underscore, hyphen
+validate_username() {
+    local name="$1"
+    if [ -z "$name" ]; then
+        log_error "Username is required"
+        return 1
+    fi
+    if ! [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        log_error "Username must contain only letters, numbers, underscore and hyphen"
+        return 1
+    fi
+    return 0
+}
+
+# Find first free port pair starting at base, step 5 (10010, 10015, 10020...)
+# Sets GATEWAY_PORT and DASHBOARD_PORT (gateway+1)
+find_free_port_pair() {
+    local base=10010
+    local step=5
+    while true; do
+        local gw=$base
+        local dash=$((base + 1))
+        if ! port_in_use "$gw" && ! port_in_use "$dash"; then
+            GATEWAY_PORT=$gw
+            DASHBOARD_PORT=$dash
+            return 0
+        fi
+        base=$((base + step))
+        if [ "$base" -gt 65535 ]; then
+            log_error "No free port pair found"
+            return 1
+        fi
+    done
+}
+
+port_in_use() {
+    local port=$1
+    if command -v ss &>/dev/null; then
+        ss -tuln 2>/dev/null | grep -q ":$port "
+        return $?
+    fi
+    if command -v lsof &>/dev/null; then
+        lsof -i ":$port" -sTCP:LISTEN -t &>/dev/null
+        return $?
+    fi
+    if command -v netstat &>/dev/null; then
+        netstat -an 2>/dev/null | grep -q "\.$port .*LISTEN"
+        return $?
+    fi
+    # Fallback: try binding (bash builtin)
+    (echo >/dev/tcp/127.0.0.1/"$port") 2>/dev/null && return 0
+    return 1
+}
+
 # Main script
 print_banner
 
@@ -188,6 +253,26 @@ if [ $DOCKER_INFO_EXIT -ne 0 ]; then
 fi
 log_success "Docker is running"
 
+# Resolve username for multi-instance (required for setup, not for --pull-only)
+if [ "$PULL_ONLY" = false ]; then
+    if [ -z "$USERNAME" ]; then
+        if [ -t 0 ]; then
+            echo -e "\n${BOLD}Instance username (e.g. abc → /home/abc, stack abc-openclaw):${NC}"
+            read -r USERNAME
+        fi
+        if [ -z "$USERNAME" ]; then
+            log_error "Username is required. Use --username NAME or run interactively."
+            exit 1
+        fi
+    fi
+    if ! validate_username "$USERNAME"; then
+        exit 1
+    fi
+    INSTANCE_HOME="/home/$USERNAME"
+    COMPOSE_PROJECT="${USERNAME}-openclaw"
+    [ -z "$INSTALL_DIR" ] && INSTALL_DIR="${OPENCLAW_INSTALL_DIR:-$INSTANCE_HOME/openclaw}"
+fi
+
 # Pull only mode
 if [ "$PULL_ONLY" = true ]; then
     log_step "Pulling OpenClaw image..."
@@ -202,40 +287,34 @@ mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR"
 log_success "Created $INSTALL_DIR"
 
+log_step "Creating instance home and data directories..."
+if ! mkdir -p "$INSTANCE_HOME"; then
+    log_error "Cannot create $INSTANCE_HOME (may need root). Try: sudo $0 --username $USERNAME"
+    exit 1
+fi
+OPENCLAW_DIR="$INSTANCE_HOME/.openclaw"
+mkdir -p "$OPENCLAW_DIR"
+mkdir -p "$OPENCLAW_DIR/workspace"
+log_success "Created $INSTANCE_HOME and $OPENCLAW_DIR"
+
 log_step "Downloading docker-compose.yml..."
 curl -fsSL "$COMPOSE_URL" -o docker-compose.yml
 
-# Update docker-compose.yml to use correct home directory when running with sudo
-if [ -n "$SUDO_USER" ]; then
-    USER_HOME=$(get_user_home)
-    # Replace ~/.openclaw with the actual user's home directory
-    if grep -q "~/.openclaw" docker-compose.yml; then
-        if sed -i.bak "s|~/.openclaw|$USER_HOME/.openclaw|g" docker-compose.yml; then
-            rm -f docker-compose.yml.bak
-            # Verify the replacement actually occurred
-            if ! grep -q "~/.openclaw" docker-compose.yml; then
-                log_success "Updated docker-compose.yml for sudo user ($SUDO_USER)"
-            else
-                log_warning "sed replacement may have failed, check docker-compose.yml manually"
-            fi
-        else
-            log_warning "Failed to update docker-compose.yml paths"
-        fi
-    else
-        log_warning "docker-compose.yml doesn't contain '~/.openclaw', skipping path update"
-    fi
+# Replace host mount path with instance home (multi-instance data isolation)
+if grep -q "~/.openclaw" docker-compose.yml; then
+    sed -i.bak "s|~/.openclaw|$OPENCLAW_DIR|g" docker-compose.yml
+    rm -f docker-compose.yml.bak
+    log_success "Updated docker-compose.yml mounts to $OPENCLAW_DIR"
 fi
 
+# Allocate port pair (10010, 10015, 10020... gateway; gateway+1 for dashboard)
+find_free_port_pair
+log_success "Using ports: gateway $GATEWAY_PORT, dashboard $DASHBOARD_PORT"
+sed -i.bak "s|\"18789:18789\"|\"${GATEWAY_PORT}:18789\"|" docker-compose.yml
+sed -i.bak "s|\"18790:18790\"|\"${DASHBOARD_PORT}:18790\"|" docker-compose.yml
+rm -f docker-compose.yml.bak
+
 log_success "Downloaded docker-compose.yml"
-
-log_step "Creating data directories..."
-
-# Determine the correct home directory
-USER_HOME=$(get_user_home)
-OPENCLAW_DIR="$USER_HOME/.openclaw"
-
-mkdir -p "$OPENCLAW_DIR"
-mkdir -p "$OPENCLAW_DIR/workspace"
 
 # Fix permissions for container access
 # Docker container runs as node user (UID 1000, GID 1000)
@@ -289,9 +368,9 @@ if [ "$SKIP_ONBOARD" = false ]; then
     echo -e "${YELLOW}Follow the prompts to complete setup.${NC}\n"
     
     # Run onboarding interactively (works with bash process substitution)
-    if ! $COMPOSE_CMD run --rm openclaw-cli onboard; then
+    if ! $COMPOSE_CMD -p "$COMPOSE_PROJECT" run --rm openclaw-cli onboard; then
         log_warning "Onboarding was cancelled or failed"
-        echo -e "${YELLOW}You can run it later with:${NC} cd $INSTALL_DIR && $COMPOSE_CMD run --rm openclaw-cli onboard"
+        echo -e "${YELLOW}You can run it later with:${NC} cd $INSTALL_DIR && $COMPOSE_CMD -p $COMPOSE_PROJECT run --rm openclaw-cli onboard"
     else
         log_success "Onboarding complete!"
     fi
@@ -300,12 +379,12 @@ fi
 # Start gateway
 if [ "$NO_START" = false ]; then
     log_step "Starting OpenClaw gateway..."
-    $COMPOSE_CMD up -d openclaw-gateway
+    $COMPOSE_CMD -p "$COMPOSE_PROJECT" up -d openclaw-gateway
     
     # Wait for gateway to be ready
     echo -n "Waiting for gateway to start"
     for i in {1..30}; do
-        if curl -s http://localhost:18789/health &> /dev/null; then
+        if curl -s "http://localhost:${GATEWAY_PORT}/health" &> /dev/null; then
             echo ""
             log_success "Gateway is running!"
             break
@@ -314,9 +393,9 @@ if [ "$NO_START" = false ]; then
         sleep 1
     done
     
-    if ! curl -s http://localhost:18789/health &> /dev/null; then
+    if ! curl -s "http://localhost:${GATEWAY_PORT}/health" &> /dev/null; then
         echo ""
-        log_warning "Gateway may still be starting. Check logs with: docker logs openclaw-gateway"
+        log_warning "Gateway may still be starting. Check logs with: docker logs ${COMPOSE_PROJECT}-openclaw-gateway-1"
     fi
 fi
 
@@ -328,19 +407,19 @@ echo -e "${GREEN}║                                                            
 echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
 
 echo -e "\n${BOLD}Quick reference:${NC}"
-echo -e "  ${CYAN}Dashboard:${NC}      http://localhost:18790/?token=YOUR_TOKEN"
-echo -e "  ${CYAN}GET TOKEN:${NC}      http://localhost:18790/?token=YOUR_TOKEN"
-echo -e "  ${CYAN}Config:${NC}         ~/.openclaw/"
-echo -e "  ${CYAN}Workspace:${NC}      cat ~/.openclaw/openclaw.json| grep '"token":' | grep -v '"mode"' | cut -d '\"' -f4"
+echo -e "  ${CYAN}Instance:${NC}       $COMPOSE_PROJECT (user: $USERNAME)"
+echo -e "  ${CYAN}Dashboard:${NC}      http://localhost:${DASHBOARD_PORT}/?token=YOUR_TOKEN"
+echo -e "  ${CYAN}Gateway:${NC}        http://localhost:${GATEWAY_PORT}"
+echo -e "  ${CYAN}Config:${NC}         $OPENCLAW_DIR"
 echo -e "  ${CYAN}Install dir:${NC}    $INSTALL_DIR"
 
 echo -e "\n${BOLD}Useful commands:${NC}"
-echo -e "  ${CYAN}View logs:${NC}      docker logs -f openclaw-gateway"
-echo -e "  ${CYAN}Stop:${NC}           cd $INSTALL_DIR && $COMPOSE_CMD down"
-echo -e "  ${CYAN}Start:${NC}          cd $INSTALL_DIR && $COMPOSE_CMD up -d openclaw-gateway"
-echo -e "  ${CYAN}Restart:${NC}        cd $INSTALL_DIR && $COMPOSE_CMD restart openclaw-gateway"
-echo -e "  ${CYAN}CLI:${NC}            cd $INSTALL_DIR && $COMPOSE_CMD run --rm openclaw-cli <command>"
-echo -e "  ${CYAN}Update:${NC}         docker pull $IMAGE && cd $INSTALL_DIR && $COMPOSE_CMD up -d"
+echo -e "  ${CYAN}View logs:${NC}      cd $INSTALL_DIR && $COMPOSE_CMD -p $COMPOSE_PROJECT logs -f openclaw-gateway"
+echo -e "  ${CYAN}Stop:${NC}           cd $INSTALL_DIR && $COMPOSE_CMD -p $COMPOSE_PROJECT down"
+echo -e "  ${CYAN}Start:${NC}          cd $INSTALL_DIR && $COMPOSE_CMD -p $COMPOSE_PROJECT up -d openclaw-gateway"
+echo -e "  ${CYAN}Restart:${NC}        cd $INSTALL_DIR && $COMPOSE_CMD -p $COMPOSE_PROJECT restart openclaw-gateway"
+echo -e "  ${CYAN}CLI:${NC}            cd $INSTALL_DIR && $COMPOSE_CMD -p $COMPOSE_PROJECT run --rm openclaw-cli <command>"
+echo -e "  ${CYAN}Update:${NC}         docker pull $IMAGE && cd $INSTALL_DIR && $COMPOSE_CMD -p $COMPOSE_PROJECT up -d"
 
 echo -e "\n${BOLD}Documentation:${NC}  https://docs.openclaw.ai"
 echo -e "${BOLD}Support:${NC}        https://discord.gg/clawd"
