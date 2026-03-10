@@ -340,6 +340,9 @@ if grep -q "~/.openclaw" docker-compose.yml; then
 fi
 
 # Container names with username prefix (e.g. abc-openclaw-gateway, abc-openclaw-socat)
+# Remove any existing container_name lines to avoid duplicate key (template or previous run)
+sed -i.bak '/^    container_name:/d' docker-compose.yml
+rm -f docker-compose.yml.bak
 awk -v p="$COMPOSE_PROJECT" '
   /^  openclaw-gateway:/  { print; print "    container_name: " p "-gateway"; next }
   /^  socat-proxy:/       { print; print "    container_name: " p "-socat"; next }
