@@ -44,6 +44,8 @@ fi
 NO_START=false
 SKIP_ONBOARD=false
 PULL_ONLY=false
+# Default host network (port rule 10010/10015/... still applies); use --bridge for bridge mode
+HOST_NETWORK=true
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -58,6 +60,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --pull-only)
             PULL_ONLY=true
+            shift
+            ;;
+        --host-network)
+            HOST_NETWORK=true
+            shift
+            ;;
+        --bridge)
+            HOST_NETWORK=false
             shift
             ;;
         --username)
@@ -77,8 +87,10 @@ while [[ $# -gt 0 ]]; do
             echo "  --username NAME     Instance username (creates /home/NAME, used as stack prefix)"
             echo "  --install-dir DIR  Installation directory (default: /home/<username>/openclaw)"
             echo "  --no-start         Don't start the gateway after setup"
-            echo "  --skip-onboard      Skip onboarding wizard"
-            echo "  --pull-only         Only pull the image, don't set up"
+            echo "  --skip-onboard     Skip onboarding wizard"
+            echo "  --pull-only        Only pull the image, don't set up"
+            echo "  --host-network    Use host network (default); ports 10010/10015/... on host"
+            echo "  --bridge          Use bridge network and port mapping instead of host"
             echo "  --help, -h          Show this help message"
             exit 0
             ;;
@@ -327,12 +339,36 @@ if grep -q "~/.openclaw" docker-compose.yml; then
     log_success "Updated docker-compose.yml mounts to $OPENCLAW_DIR"
 fi
 
-# Allocate port pair (10010, 10015, 10020... gateway; gateway+1 for dashboard)
+# Container names with username prefix (e.g. abc-openclaw-gateway, abc-openclaw-socat)
+awk -v p="$COMPOSE_PROJECT" '
+  /^  openclaw-gateway:/  { print; print "    container_name: " p "-gateway"; next }
+  /^  socat-proxy:/       { print; print "    container_name: " p "-socat"; next }
+  /^  openclaw-cli:/      { print; print "    container_name: " p "-cli"; next }
+  { print }
+' docker-compose.yml > docker-compose.yml.tmp && mv docker-compose.yml.tmp docker-compose.yml
+
+# Port allocation: always use 10010, 10015, 10020... (find first free pair)
 find_free_port_pair
-log_success "Using ports: gateway $GATEWAY_PORT, dashboard $DASHBOARD_PORT"
-# Bind to 0.0.0.0 so host and other machines on the network can access
-sed -i.bak "s|\"18789:18789\"|\"0.0.0.0:${GATEWAY_PORT}:18789\"|" docker-compose.yml
-sed -i.bak "s|\"18790:18790\"|\"0.0.0.0:${DASHBOARD_PORT}:18790\"|" docker-compose.yml
+
+# Network: default host (ports on host directly), or bridge with 0.0.0.0 mapping
+if [ "$HOST_NETWORK" = true ]; then
+    log_success "Using host network: gateway $GATEWAY_PORT, dashboard $DASHBOARD_PORT (direct on host)"
+    # Remove ports block and add network_mode: host
+    sed -i.bak '/^    ports:$/d;/^      - "18789:18789"$/d;/^      - "18790:18790"$/d' docker-compose.yml
+    awk '/tty: true/ { if (++tty==1) { print; print "    network_mode: \"host\""; next } }1' docker-compose.yml > docker-compose.yml.tmp && mv docker-compose.yml.tmp docker-compose.yml
+    # Gateway listens on 18789 in container/host; use two socats to expose GATEWAY_PORT and DASHBOARD_PORT
+    # Socat 1 (existing): dashboard on DASHBOARD_PORT -> 127.0.0.1:18789
+    sed -i.bak "s|TCP-LISTEN:18790,fork,bind=0.0.0.0,reuseaddr TCP:127.0.0.1:18789|TCP-LISTEN:${DASHBOARD_PORT},fork,bind=0.0.0.0,reuseaddr TCP:127.0.0.1:18789|" docker-compose.yml
+    # Socat 2 (new): gateway on GATEWAY_PORT -> 127.0.0.1:18789 (insert before openclaw-cli)
+    awk -v gw="$GATEWAY_PORT" -v p="$COMPOSE_PROJECT" '
+      /^  openclaw-cli:/ { print "  socat-gateway:"; print "    container_name: " p "-socat-gateway"; print "    image: alpine/socat"; print "    restart: unless-stopped"; print "    network_mode: \"service:openclaw-gateway\""; print "    command: \"TCP-LISTEN:"gw",fork,bind=0.0.0.0,reuseaddr TCP:127.0.0.1:18789\""; print "" }
+      { print }
+    ' docker-compose.yml > docker-compose.yml.tmp && mv docker-compose.yml.tmp docker-compose.yml
+else
+    log_success "Using bridge: gateway $GATEWAY_PORT, dashboard $DASHBOARD_PORT (bound to 0.0.0.0)"
+    sed -i.bak "s|\"18789:18789\"|\"0.0.0.0:${GATEWAY_PORT}:18789\"|" docker-compose.yml
+    sed -i.bak "s|\"18790:18790\"|\"0.0.0.0:${DASHBOARD_PORT}:18790\"|" docker-compose.yml
+fi
 rm -f docker-compose.yml.bak
 
 log_success "Downloaded docker-compose.yml"
@@ -416,7 +452,7 @@ if [ "$NO_START" = false ]; then
     
     if ! curl -s "http://localhost:${GATEWAY_PORT}/health" &> /dev/null; then
         echo ""
-        log_warning "Gateway may still be starting. Check logs with: docker logs ${COMPOSE_PROJECT}-openclaw-gateway-1"
+        log_warning "Gateway may still be starting. Check logs with: docker logs ${COMPOSE_PROJECT}-gateway"
     fi
 fi
 
@@ -432,6 +468,9 @@ echo -e "  ${CYAN}Instance:${NC}       $COMPOSE_PROJECT (user: $USERNAME)"
 echo -e "  ${CYAN}Dashboard:${NC}      http://localhost:${DASHBOARD_PORT}/?token=YOUR_TOKEN"
 echo -e "  ${CYAN}Gateway:${NC}        http://localhost:${GATEWAY_PORT}"
 echo -e "  ${CYAN}From other machines:${NC} Use this host's IP (e.g. http://<host-ip>:${DASHBOARD_PORT}). Ensure firewall allows ports ${GATEWAY_PORT}, ${DASHBOARD_PORT}."
+if [ "$HOST_NETWORK" = false ]; then
+    echo -e "  ${CYAN}Using bridge.${NC} To use host network (default), reinstall without ${CYAN}--bridge${NC}."
+fi
 echo -e "  ${CYAN}Config:${NC}         $OPENCLAW_DIR"
 echo -e "  ${CYAN}Install dir:${NC}    $INSTALL_DIR"
 
