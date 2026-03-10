@@ -330,8 +330,9 @@ fi
 # Allocate port pair (10010, 10015, 10020... gateway; gateway+1 for dashboard)
 find_free_port_pair
 log_success "Using ports: gateway $GATEWAY_PORT, dashboard $DASHBOARD_PORT"
-sed -i.bak "s|\"18789:18789\"|\"${GATEWAY_PORT}:18789\"|" docker-compose.yml
-sed -i.bak "s|\"18790:18790\"|\"${DASHBOARD_PORT}:18790\"|" docker-compose.yml
+# Bind to 0.0.0.0 so host and other machines on the network can access
+sed -i.bak "s|\"18789:18789\"|\"0.0.0.0:${GATEWAY_PORT}:18789\"|" docker-compose.yml
+sed -i.bak "s|\"18790:18790\"|\"0.0.0.0:${DASHBOARD_PORT}:18790\"|" docker-compose.yml
 rm -f docker-compose.yml.bak
 
 log_success "Downloaded docker-compose.yml"
@@ -430,6 +431,7 @@ echo -e "\n${BOLD}Quick reference:${NC}"
 echo -e "  ${CYAN}Instance:${NC}       $COMPOSE_PROJECT (user: $USERNAME)"
 echo -e "  ${CYAN}Dashboard:${NC}      http://localhost:${DASHBOARD_PORT}/?token=YOUR_TOKEN"
 echo -e "  ${CYAN}Gateway:${NC}        http://localhost:${GATEWAY_PORT}"
+echo -e "  ${CYAN}From other machines:${NC} Use this host's IP (e.g. http://<host-ip>:${DASHBOARD_PORT}). Ensure firewall allows ports ${GATEWAY_PORT}, ${DASHBOARD_PORT}."
 echo -e "  ${CYAN}Config:${NC}         $OPENCLAW_DIR"
 echo -e "  ${CYAN}Install dir:${NC}    $INSTALL_DIR"
 
