@@ -452,7 +452,7 @@ fi
 # Start gateway
 if [ "$NO_START" = false ]; then
     log_step "Starting OpenClaw gateway..."
-    $COMPOSE_CMD -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT" up -d openclaw-gateway
+    $COMPOSE_CMD -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT" up -d $USERNAME-openclaw-gateway
     
     # Wait for gateway to be ready
     echo -n "Waiting for gateway to start"
