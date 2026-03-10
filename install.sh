@@ -257,7 +257,7 @@ log_success "Docker is running"
 if [ "$PULL_ONLY" = false ]; then
     if [ -z "$USERNAME" ]; then
         if [ -t 0 ]; then
-            echo -e "\n${BOLD}Instance username (e.g. abc → /home/abc, stack abc-openclaw):${NC}"
+            echo -e "\n${BOLD}Instance username (e.g. abc → /Users/abc on macOS, /home/abc on Linux; stack abc-openclaw):${NC}"
             read -r USERNAME
         fi
         if [ -z "$USERNAME" ]; then
@@ -268,7 +268,12 @@ if [ "$PULL_ONLY" = false ]; then
     if ! validate_username "$USERNAME"; then
         exit 1
     fi
-    INSTANCE_HOME="/home/$USERNAME"
+    # macOS uses /Users, Linux uses /home
+    if [ "$(uname -s)" = "Darwin" ]; then
+        INSTANCE_HOME="/Users/$USERNAME"
+    else
+        INSTANCE_HOME="/home/$USERNAME"
+    fi
     COMPOSE_PROJECT="${USERNAME}-openclaw"
     [ -z "$INSTALL_DIR" ] && INSTALL_DIR="${OPENCLAW_INSTALL_DIR:-$INSTANCE_HOME/openclaw}"
 fi
@@ -291,6 +296,21 @@ log_step "Creating instance home and data directories..."
 if ! mkdir -p "$INSTANCE_HOME"; then
     log_error "Cannot create $INSTANCE_HOME (may need root). Try: sudo $0 --username $USERNAME"
     exit 1
+fi
+# Set ownership of instance home for container user (UID 1000) first; with sudo, add group for host user
+if [ "$(id -u)" -eq 0 ]; then
+    if [ -n "$SUDO_USER" ]; then
+        SUDO_GID=$(id -g "$SUDO_USER")
+        chown 1000:"$SUDO_GID" "$INSTANCE_HOME"
+        chmod 775 "$INSTANCE_HOME"
+        log_success "Set $INSTANCE_HOME to UID 1000 (container) with group $SUDO_USER"
+    else
+        chown 1000:1000 "$INSTANCE_HOME"
+        chmod 755 "$INSTANCE_HOME"
+        log_success "Set $INSTANCE_HOME ownership to 1000:1000 (container user)"
+    fi
+else
+    chmod 755 "$INSTANCE_HOME" 2>/dev/null || true
 fi
 OPENCLAW_DIR="$INSTANCE_HOME/.openclaw"
 mkdir -p "$OPENCLAW_DIR"
