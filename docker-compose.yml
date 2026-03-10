@@ -3,6 +3,7 @@ services:
     image: ghcr.io/phioranex/openclaw-docker:latest
     restart: unless-stopped
     stdin_open: true
+    container_name: $REPLACE_WITH_USERNAME$-openclaw-gateway
     tty: true
     # Uncomment the following line if running on Synology NAS or other systems with UID/GID issues
     # user: "1000:1000"

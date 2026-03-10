@@ -333,6 +333,10 @@ log_success "Created $INSTANCE_HOME and $OPENCLAW_DIR"
 log_step "Downloading docker-compose.yml..."
 curl -fsSL "$COMPOSE_URL" -o "$COMPOSE_FILE"
 
+# Replace placeholder with actual username (e.g. container_name: $REPLACE_WITH_USERNAME$-openclaw-gateway)
+sed -i.bak "s|\$REPLACE_WITH_USERNAME\$|$USERNAME|g" "$COMPOSE_FILE"
+rm -f "$COMPOSE_FILE.bak"
+
 # Replace host mount path with instance home (multi-instance data isolation)
 if grep -q "~/.openclaw" "$COMPOSE_FILE"; then
     sed -i.bak "s|~/.openclaw|$OPENCLAW_DIR|g" "$COMPOSE_FILE"
@@ -452,7 +456,7 @@ fi
 # Start gateway
 if [ "$NO_START" = false ]; then
     log_step "Starting OpenClaw gateway..."
-    $COMPOSE_CMD -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT" up -d $USERNAME-openclaw-gateway
+    $COMPOSE_CMD -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT" up -d openclaw-gateway
     
     # Wait for gateway to be ready
     echo -n "Waiting for gateway to start"
